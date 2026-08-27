@@ -2,6 +2,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use candle::quantized::gguf_file;
@@ -15,7 +16,7 @@ const SYSTEM_PROMPT: &str = "You are a text normalizer for speech-to-text transc
 const CONTROL_LINE: &str = "[Styling: semi-formal] [Structure: prose] [Context: general]";
 
 const MODEL_DIR: &str = "assets/models";
-const WHISPER_FILENAME: &str = "ggml-large-v3-turbo-q5_0.bin";
+const DEFAULT_WHISPER_FILENAME: &str = "ggml-base.en-q5_1.bin";
 const S1_FILENAME: &str = "s1-mini-q4_k_m.gguf";
 const TOKENIZER_FILENAME: &str = "s1-mini-tokenizer.json";
 
@@ -34,10 +35,12 @@ pub fn start_model_worker() -> Sender<InferenceJob> {
 }
 
 fn model_worker(receiver: Receiver<InferenceJob>) {
-    let mut runtime: Option<Result<ModelRuntime, String>> = None;
+    // Load once in the background as soon as the app starts. A normal user
+    // spends this time reading the UI or speaking, so the first stop click
+    // does not also pay the model initialization cost.
+    let mut runtime = ModelRuntime::load().map_err(format_error);
     for job in receiver {
-        let runtime = runtime.get_or_insert_with(|| ModelRuntime::load().map_err(format_error));
-        let result = match runtime {
+        let result = match &mut runtime {
             Ok(runtime) => runtime.process(&job.samples).map_err(format_error),
             Err(message) => Err(message.clone()),
         };
@@ -54,8 +57,13 @@ struct ModelRuntime {
 
 impl ModelRuntime {
     fn load() -> Result<Self> {
-        let model_dir = resolve_model_dir()?;
-        let whisper_path = model_dir.join(WHISPER_FILENAME);
+        let load_started = Instant::now();
+        let whisper_filename = std::env::var("RAMBLER_WHISPER_MODEL")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_WHISPER_FILENAME.to_string());
+        let model_dir = resolve_model_dir(&whisper_filename)?;
+        let whisper_path = model_dir.join(&whisper_filename);
         let s1_path = model_dir.join(S1_FILENAME);
         let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
 
@@ -84,20 +92,45 @@ impl ModelRuntime {
                 )
             })?;
 
-        Ok(Self {
+        let runtime = Self {
             whisper,
             normalizer,
             tokenizer,
             device,
-        })
+        };
+        if std::env::var_os("RAMBLER_PROFILE").is_some() {
+            eprintln!(
+                "rambler profile: ASR={} model load = {:.2?}",
+                whisper_filename,
+                load_started.elapsed()
+            );
+        }
+        Ok(runtime)
     }
 
     fn process(&mut self, samples: &[f32]) -> Result<String> {
+        let process_started = Instant::now();
+        let transcribe_started = Instant::now();
         let raw = self.transcribe(samples)?;
+        if std::env::var_os("RAMBLER_PROFILE").is_some() {
+            eprintln!(
+                "rambler profile: Whisper = {:.2?} ({} samples)",
+                transcribe_started.elapsed(),
+                samples.len()
+            );
+        }
         if raw.trim().is_empty() {
             bail!("No speech was detected. Try speaking closer to the microphone.");
         }
+        let normalize_started = Instant::now();
         let clean = self.normalize(raw.trim())?;
+        if std::env::var_os("RAMBLER_PROFILE").is_some() {
+            eprintln!(
+                "rambler profile: S1-mini = {:.2?}; total = {:.2?}",
+                normalize_started.elapsed(),
+                process_started.elapsed()
+            );
+        }
         if clean.trim().is_empty() {
             bail!("Only silence or filler words were detected.");
         }
@@ -109,20 +142,32 @@ impl ModelRuntime {
             .whisper
             .create_state()
             .map_err(|error| anyhow!("could not create Whisper state: {error}"))?;
-        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-            beam_size: 5,
-            patience: -1.0,
-        });
+        let sampling = if std::env::var_os("RAMBLER_WHISPER_GREEDY").is_some() {
+            SamplingStrategy::Greedy { best_of: 1 }
+        } else {
+            SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            }
+        };
+        let mut params = FullParams::new(sampling);
         params.set_language(Some("en"));
         params.set_translate(false);
         params.set_no_context(true);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
-        // Keep inference predictable on machines with many logical cores. A
-        // small fixed upper bound also leaves headroom for WebKit and the
-        // local normalizer under the application's memory limit.
-        let threads = thread::available_parallelism().map_or(4, |count| count.get().min(4) as i32);
+        // Whisper is the latency-sensitive stage. Eight workers is a good
+        // CPU/memory balance on desktop hardware; allow a deployment to tune
+        // it without recompiling (for example, set it to 4 on a smaller
+        // machine).
+        let available_threads = thread::available_parallelism().map_or(4, |count| count.get());
+        let threads = std::env::var("RAMBLER_WHISPER_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(8)
+            .min(available_threads) as i32;
         params.set_n_threads(threads);
         state
             .full(params, samples)
@@ -178,7 +223,7 @@ impl ModelRuntime {
     }
 }
 
-fn resolve_model_dir() -> Result<PathBuf> {
+fn resolve_model_dir(whisper_filename: &str) -> Result<PathBuf> {
     let mut candidates = Vec::new();
 
     // `cargo run` starts in the project directory. For a copied release
@@ -193,7 +238,7 @@ fn resolve_model_dir() -> Result<PathBuf> {
         candidates.push(current_dir.join(MODEL_DIR));
     }
 
-    let required = [WHISPER_FILENAME, S1_FILENAME, TOKENIZER_FILENAME];
+    let required = [whisper_filename, S1_FILENAME, TOKENIZER_FILENAME];
     for candidate in &candidates {
         if required.iter().all(|name| candidate.join(name).is_file()) {
             return Ok(candidate.clone());
@@ -206,7 +251,7 @@ fn resolve_model_dir() -> Result<PathBuf> {
         .collect::<Vec<_>>()
         .join("\n");
     bail!(
-        "Local model files are missing. Put Whisper, S1-mini, and the tokenizer in assets/models/. Searched:\n{searched}"
+        "Local model files are missing. Put {whisper_filename}, {S1_FILENAME}, and {TOKENIZER_FILENAME} in assets/models/. Searched:\n{searched}"
     )
 }
 

@@ -3,14 +3,14 @@
 A minimal, entirely local voice-to-text desktop app written in Rust with Dioxus.
 
 ```text
-cpal microphone → Whisper large-v3-turbo → S1-mini by Superwhisper → clipboard
+cpal microphone → Whisper base.en Q5_1 → S1-mini by Superwhisper → clipboard
 ```
 
 There is no Python, JavaScript, web server, external stylesheet, hosted inference API, or runtime model download. The UI, audio capture, local model inference, transcript cleanup, and clipboard integration all run inside one Rust process. The model files stay next to the app in `assets/models/` and are opened locally when the first recording is processed.
 
 ## Models
 
-- **Whisper large-v3-turbo Q5** via `whisper-rs` is the ASR model. Turbo keeps Whisper's strong recognition while using only four decoder layers; the local Q5 conversion is about 574 MB.
+- **Whisper base.en Q5_1** via `whisper-rs` is the default ASR model. It is English-specialized and about 60 MB, giving a much faster CPU turnaround for short dictation while retaining good accuracy. Set `RAMBLER_WHISPER_MODEL=ggml-large-v3-turbo-q5_0.bin` when maximum recognition quality matters more than latency; that optional model is about 574 MB.
 - **S1-mini by Superwhisper Q4_K_M** via Candle's pure-Rust Qwen3 runtime cleans the raw transcript. It removes fillers, resolves corrections, restores punctuation/capitalization, and formats spoken numbers, dates, currency, and email addresses. The local quantized model is about 484 MB.
 
 S1-mini is English-only, so the application currently sets Whisper to English. The model files and tokenizer are read from `assets/models/`; transcription does not need Hugging Face, a model cache, or an internet connection.
@@ -27,6 +27,8 @@ CARGO_BUILD_JOBS=4 CMAKE_BUILD_PARALLEL_LEVEL=4 cargo run --release
 The `ulimit` caps the app at 24 GiB of virtual memory so a bad model allocation fails instead of exhausting the machine. On Unix, the Rust executable applies the same 24 GiB limit to itself as a second safeguard. WebKit needs this larger virtual-address ceiling during startup even though its resident memory is much smaller. Use a release build: local inference is substantially slower in a debug build.
 
 If compilation is memory constrained, retry with `CARGO_BUILD_JOBS=1 CMAKE_BUILD_PARALLEL_LEVEL=1`.
+
+Whisper uses eight CPU threads by default and the worker loads both local models in the background when the app starts. For a faster but slightly less conservative decoder, set `RAMBLER_WHISPER_GREEDY=1`; use `RAMBLER_WHISPER_THREADS=16` on a machine with enough CPU headroom.
 
 Click the microphone once to record and again to stop. When both local inference stages finish, the cleaned transcript appears with a Copy button.
 
@@ -51,6 +53,6 @@ The test decodes the downloaded WAV, resamples it if needed, submits samples to 
 - `src/audio.rs` — native microphone capture and 16 kHz resampling
 - `src/models.rs` — local model loading, Whisper inference, and exact S1-mini prompt
 - `src/style.rs` — UI styling embedded in Rust
-- `assets/models/` — Whisper, S1-mini, and tokenizer assets used at runtime
+- `assets/models/` — default/optional Whisper, S1-mini, and tokenizer assets used at runtime
 
 Read [MODEL_NOTICE.md](MODEL_NOTICE.md) before redistributing the downloaded model weights.

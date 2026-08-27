@@ -11,7 +11,7 @@ use std::sync::mpsc;
 const TARGET_RATE: u32 = 16_000;
 
 #[test]
-#[ignore = "loads roughly 1 GB of local model weights; run with RAMBLER_E2E_WAV=/path/to/file.wav"]
+#[ignore = "loads local model weights; run with RAMBLER_E2E_WAV=/path/to/file.wav"]
 fn speech_pipeline() -> Result<()> {
     let path = env::var("RAMBLER_E2E_WAV")
         .context("set RAMBLER_E2E_WAV to a speech WAV file before running this test")?;
