@@ -1,0 +1,6 @@
+[application]
+name = "Rambler"
+default_platform = "desktop"
+
+[desktop]
+resources = []
