@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 
-const WHISPER_SAMPLE_RATE: u32 = 16_000;
+const TARGET_SAMPLE_RATE: u32 = 16_000;
 
 struct RecordingSession {
     _stream: Stream,
@@ -86,7 +86,7 @@ pub fn stop_recording() -> Result<Vec<f32>, String> {
         .map_err(|_| "The microphone was still finishing its last audio frame.".to_string())?
         .into_inner()
         .map_err(|_| "The recorded audio could not be read.".to_string())?;
-    Ok(resample_linear(&samples, sample_rate, WHISPER_SAMPLE_RATE))
+    Ok(resample_linear(&samples, sample_rate, TARGET_SAMPLE_RATE))
 }
 
 fn append_f32(output: &Arc<Mutex<Vec<f32>>>, input: &[f32], channels: usize) {

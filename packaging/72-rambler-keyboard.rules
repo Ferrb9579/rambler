@@ -1,0 +1,3 @@
+# Give the active desktop user non-exclusive access to keyboard events.
+# Rambler only observes Ctrl gestures; it never grabs or suppresses input.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="seat", TAG+="uaccess"

@@ -1,222 +1,347 @@
-mod models;
+mod controller;
+mod ctrl_shortcut;
+mod model_download;
+mod preferences;
+mod settings;
 mod style;
 
-use std::sync::mpsc;
-
+use dioxus::desktop::{
+    Config, DesktopContext, LogicalSize, WindowBuilder, WindowEvent, tao::event::Event as TaoEvent,
+    use_wry_event_handler,
+};
 use dioxus::prelude::*;
-use models::{InferenceJob, start_model_worker};
-use rambler::audio;
+use dioxus_free_icons::Icon;
+use dioxus_free_icons::icons::md_action_icons::{MdDragIndicator, MdHourglassEmpty, MdSettings};
+use dioxus_free_icons::icons::md_av_icons::{MdMic, MdStop};
+use dioxus_free_icons::icons::md_content_icons::MdContentCopy;
+use dioxus_free_icons::icons::md_navigation_icons::{MdCheck, MdClose, MdMoreVert};
 
-#[derive(Clone, Copy, PartialEq)]
-enum Phase {
-    Ready,
-    Recording,
-    Processing,
+use controller::{Phase, RecordingCommand, RecordingController, RecordingEvent};
+use preferences::{Preferences, ShortcutControl};
+use settings::SettingsPage;
+
+const WINDOW_WIDTH: f64 = 184.0;
+const TOOLBAR_HEIGHT: f64 = 54.0;
+const MENU_HEIGHT: f64 = 154.0;
+const SETTINGS_WIDTH: f64 = 480.0;
+const SETTINGS_HEIGHT: f64 = 640.0;
+const WEBVIEW_HEAD: &str = r#"
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<script>
+window.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && ['+', '-', '=', '0'].includes(event.key)) {
+    event.preventDefault();
+  }
+}, { capture: true });
+window.addEventListener('wheel', (event) => {
+  if (event.ctrlKey || event.metaKey) event.preventDefault();
+}, { passive: false, capture: true });
+window.addEventListener('gesturestart', (event) => event.preventDefault(), { passive: false });
+</script>
+"#;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum AppView {
+    #[default]
+    Toolbar,
+    Settings,
 }
 
 fn main() {
-    sanitize_host_environment();
-    cap_memory();
-    dioxus::launch(App);
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(window_config())
+        .launch(App);
 }
 
-#[cfg(unix)]
-fn sanitize_host_environment() {
-    // When launched from a Snap-packaged IDE, GTK/GIO can discover the IDE's
-    // private libraries and mix them with the host WebKit stack. Remove those
-    // loader hints before Dioxus initializes GTK.
-    if std::env::var_os("SNAP").is_some() {
-        for key in [
-            "GDK_PIXBUF_MODULEDIR",
-            "GDK_PIXBUF_MODULE_FILE",
-            "GIO_MODULE_DIR",
-            "GIO_LAUNCHED_DESKTOP_FILE",
-            "GIO_LAUNCHED_DESKTOP_FILE_PID",
-            "GSETTINGS_SCHEMA_DIR",
-            "GTK_EXE_PREFIX",
-            "GTK_IM_MODULE_FILE",
-            "GTK_MODULES",
-            "GTK_PATH",
-            "LOCPATH",
-            "SNAP",
-            "SNAP_ARCH",
-            "SNAP_COMMON",
-            "SNAP_CONTEXT",
-            "SNAP_COOKIE",
-            "SNAP_DATA",
-            "SNAP_EUID",
-            "SNAP_INSTANCE_NAME",
-            "SNAP_LAUNCHER_ARCH_TRIPLET",
-            "SNAP_LIBRARY_PATH",
-            "SNAP_NAME",
-            "SNAP_REAL_HOME",
-            "SNAP_REVISION",
-            "SNAP_UID",
-            "SNAP_USER_COMMON",
-            "SNAP_USER_DATA",
-            "SNAP_VERSION",
-            "XDG_CONFIG_DIRS",
-            "XDG_CONFIG_DIRS_VSCODE_SNAP_ORIG",
-            "XDG_DATA_DIRS",
-            "XDG_DATA_DIRS_VSCODE_SNAP_ORIG",
-            "XDG_DATA_HOME",
-        ] {
-            // This runs before Dioxus starts any threads.
-            unsafe { std::env::remove_var(key) };
-        }
+fn window_config() -> Config {
+    let window = WindowBuilder::new()
+        .with_title("Rambler")
+        .with_inner_size(LogicalSize::new(WINDOW_WIDTH, TOOLBAR_HEIGHT))
+        .with_resizable(false)
+        .with_minimizable(false)
+        .with_maximizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top(true)
+        .with_visible_on_all_workspaces(true);
 
-        // Snap's graphics sandbox can leave GTK/WebKit without a usable GL
-        // context. Software compositing keeps the app launchable in that
-        // environment; normal desktop launches are unaffected.
-        unsafe {
-            std::env::set_var("GDK_BACKEND", "x11");
-            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
-            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
-        }
-    }
+    #[cfg(target_os = "linux")]
+    let window = {
+        use dioxus::desktop::tao::platform::unix::WindowBuilderExtUnix;
+        window.with_skip_taskbar(true)
+    };
+
+    Config::new()
+        .with_window(window)
+        .with_custom_head(WEBVIEW_HEAD.to_string())
+        .with_background_color((0, 0, 0, 0))
+        .with_disable_context_menu(true)
 }
 
-#[cfg(not(unix))]
-fn sanitize_host_environment() {}
-
-#[cfg(unix)]
-fn cap_memory() {
-    // WebKit reserves a large virtual address range during startup. Keep a
-    // generous but finite ceiling so those mappings do not make the process
-    // unbounded while still leaving room for the local models.
-    const TWENTY_FOUR_GIB: u64 = 24 * 1024 * 1024 * 1024;
-    if let Ok((_, hard_limit)) = rlimit::getrlimit(rlimit::Resource::AS) {
-        let soft_limit = hard_limit.min(TWENTY_FOUR_GIB);
-        if let Err(error) = rlimit::setrlimit(rlimit::Resource::AS, soft_limit, hard_limit) {
-            eprintln!("warning: could not set the 24 GiB memory limit: {error}");
-        }
-    }
+fn resize_for_menu(window: &DesktopContext, open: bool) {
+    let height = if open { MENU_HEIGHT } else { TOOLBAR_HEIGHT };
+    window
+        .window
+        .set_inner_size(LogicalSize::new(WINDOW_WIDTH, height));
 }
 
-#[cfg(not(unix))]
-fn cap_memory() {}
+fn close_menu(mut menu_open: Signal<bool>, window: DesktopContext) {
+    menu_open.set(false);
+    window.window.request_redraw();
+    spawn(async move {
+        // WebKit must submit one transparent frame before the Wayland surface
+        // shrinks, otherwise the compositor can retain stale menu pixels.
+        tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+        resize_for_menu(&window, false);
+        window.window.request_redraw();
+    });
+}
+
+fn resize_for_settings(window: &DesktopContext, open: bool) {
+    let size = if open {
+        LogicalSize::new(SETTINGS_WIDTH, SETTINGS_HEIGHT)
+    } else {
+        LogicalSize::new(WINDOW_WIDTH, TOOLBAR_HEIGHT)
+    };
+    window.window.set_inner_size(size);
+}
 
 #[allow(non_snake_case)]
 fn App() -> Element {
-    let worker = use_hook(start_model_worker);
+    let controller = use_hook(RecordingController::start);
+    let desktop = dioxus::desktop::window();
+    let preferences = use_signal(Preferences::load);
+    let shortcut_control = use_signal(|| ShortcutControl::new(preferences.peek().shortcut_enabled));
+    let mut view = use_signal(AppView::default);
     let mut phase = use_signal(|| Phase::Ready);
     let mut transcript = use_signal(String::new);
     let mut error = use_signal(String::new);
     let mut copied = use_signal(|| false);
+    let mut copy_generation = use_signal(|| 0_u64);
+    let mut menu_open = use_signal(|| false);
 
-    let status = match phase() {
-        Phase::Ready if transcript().is_empty() => "Click to start speaking",
-        Phase::Ready => "Ready for another thought",
-        Phase::Recording => "Listening… click when you’re done",
-        Phase::Processing => "Transcribing and polishing your words…",
-    };
+    let shortcut_commands = controller.commands();
+    let shortcut_listener_control = shortcut_control.peek().clone();
+    use_hook(move || ctrl_shortcut::start(shortcut_commands, shortcut_listener_control));
+
+    let initial_window = desktop.clone();
+    use_hook(move || {
+        initial_window.set_zoom_level(1.0);
+        initial_window
+            .window
+            .set_always_on_top(preferences.peek().always_on_top);
+    });
+
+    let event_controller = controller.clone();
+    use_hook(move || {
+        spawn(async move {
+            loop {
+                let controller = event_controller.clone();
+                let event = tokio::task::spawn_blocking(move || controller.next_event()).await;
+                match event {
+                    Ok(Some(RecordingEvent::Phase(next_phase))) => phase.set(next_phase),
+                    Ok(Some(RecordingEvent::Transcript(text))) => {
+                        transcript.set(text);
+                        copied.set(false);
+                    }
+                    Ok(Some(RecordingEvent::Error(message))) => error.set(message),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        })
+    });
+
+    let drag_window = desktop.clone();
+    let menu_window = desktop.clone();
+    let close_window = desktop.clone();
+    let outside_window = desktop.clone();
+    let dismiss_window = desktop.clone();
+    let blur_window = desktop.clone();
+    let settings_window = desktop.clone();
+    let settings_back_window = desktop.clone();
+    let recording_commands = controller.commands();
+    let has_transcript = !transcript().is_empty();
+
+    use_wry_event_handler(move |event, _| {
+        if view() == AppView::Toolbar
+            && matches!(
+                event,
+                TaoEvent::WindowEvent {
+                    event: WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. },
+                    ..
+                }
+            )
+            && menu_open()
+        {
+            close_menu(menu_open, blur_window.clone());
+        }
+    });
 
     rsx! {
         style { {style::APP_CSS} }
 
-        main { class: "shell",
-            section { class: "app-card",
-                header { class: "brand",
-                    div { class: "brand-mark", "R" }
-                    span { "Rambler" }
+        div {
+            class: "app-root {preferences().theme.class_name()}",
+        if view() == AppView::Settings {
+            SettingsPage {
+                preferences,
+                shortcut_control,
+                on_close: move |_| {
+                    view.set(AppView::Toolbar);
+                    resize_for_settings(&settings_back_window, false);
+                }
+            }
+        } else {
+        main {
+            class: "app-shell",
+            onclick: move |_| {
+                if menu_open() {
+                    close_menu(menu_open, outside_window.clone());
+                }
+            },
+            nav {
+                class: "toolbar",
+                aria_label: "Rambler controls",
+                button {
+                    class: "icon-button drag-handle",
+                    aria_label: "Move Rambler",
+                    title: "Drag to move",
+                    onmousedown: move |_| drag_window.drag(),
+                    Icon { width: 24, height: 24, icon: MdDragIndicator }
                 }
 
-                div { class: "hero",
-                    p { class: "eyebrow", "VOICE NOTES, CLEANED UP" }
-                    h1 { "Say it. Get the words." }
-                    p { class: "intro", "One click to record. One click to turn your voice into clear, copy-ready text." }
-                }
-
-                div { class: "recorder",
+                div { class: "primary-actions",
                     button {
-                        class: if phase() == Phase::Recording { "record-button recording" } else { "record-button" },
-                        disabled: phase() == Phase::Processing,
-                        aria_label: if phase() == Phase::Recording { "Stop recording" } else { "Start recording" },
+                        class: if copied() { "icon-button copy-button copied" } else { "icon-button copy-button" },
+                        disabled: !has_transcript,
+                        aria_label: if copied() { "Transcript copied" } else { "Copy last transcript" },
+                        title: if has_transcript { "Copy last transcript" } else { "Nothing to copy yet" },
                         onclick: move |_| {
-                            copied.set(false);
-                            error.set(String::new());
+                            let latest = transcript();
+                            if latest.is_empty() {
+                                return;
+                            }
 
-                            if phase() == Phase::Recording {
-                                match audio::stop_recording() {
-                                    Ok(samples) if samples.len() >= 1_600 => {
-                                        phase.set(Phase::Processing);
-                                        let (reply_tx, reply_rx) = mpsc::channel();
-                                        let job = InferenceJob { samples, reply: reply_tx };
-                                        if worker.send(job).is_err() {
-                                            error.set("The model worker stopped unexpectedly.".to_string());
-                                            phase.set(Phase::Ready);
-                                            return;
+                            match arboard::Clipboard::new()
+                                .and_then(|mut clipboard| clipboard.set_text(latest))
+                            {
+                                Ok(()) => {
+                                    let generation = copy_generation() + 1;
+                                    copy_generation.set(generation);
+                                    copied.set(true);
+                                    spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+                                        if copy_generation() == generation {
+                                            copied.set(false);
                                         }
-
-                                        spawn(async move {
-                                            let result = tokio::task::spawn_blocking(move || reply_rx.recv()).await;
-                                            match result {
-                                                Ok(Ok(Ok(text))) => transcript.set(text),
-                                                Ok(Ok(Err(message))) => error.set(message),
-                                                _ => error.set("The model worker did not respond.".to_string()),
-                                            }
-                                            phase.set(Phase::Ready);
-                                        });
-                                    }
-                                    Ok(_) => error.set("That recording was too short. Try speaking for a moment longer.".to_string()),
-                                    Err(message) => error.set(message),
-                                }
-                            } else {
-                                match audio::start_recording() {
-                                    Ok(()) => {
-                                        transcript.set(String::new());
-                                        phase.set(Phase::Recording);
-                                    }
-                                    Err(message) => error.set(message),
+                                    });
+                                },
+                                Err(copy_error) => {
+                                    let message = format!("Could not copy: {copy_error}");
+                                    eprintln!("{message}");
+                                    error.set(message);
                                 }
                             }
                         },
-                        if phase() == Phase::Recording {
-                            span { class: "stop-icon" }
-                        } else if phase() == Phase::Processing {
-                            span { class: "spinner" }
+                        if copied() {
+                            Icon { width: 21, height: 21, icon: MdCheck }
                         } else {
-                            svg {
-                                view_box: "0 0 24 24",
-                                "aria-hidden": "true",
-                                path { d: "M12 15.5a3.5 3.5 0 0 0 3.5-3.5V5a3.5 3.5 0 1 0-7 0v7a3.5 3.5 0 0 0 3.5 3.5Zm-1.8-10.5a1.8 1.8 0 1 1 3.6 0v7a1.8 1.8 0 1 1-3.6 0V5Zm-5 6.7a.85.85 0 1 1 1.7 0 5.1 5.1 0 0 0 10.2 0 .85.85 0 1 1 1.7 0 6.8 6.8 0 0 1-5.95 6.74V21h2.2a.85.85 0 1 1 0 1.7h-6.1a.85.85 0 1 1 0-1.7h2.2v-2.56A6.8 6.8 0 0 1 5.2 11.7Z" }
-                            }
+                            Icon { width: 22, height: 22, icon: MdContentCopy }
                         }
                     }
-                    div { class: "status-row",
-                        if phase() == Phase::Recording { span { class: "live-dot" } }
-                        p { class: "status", "{status}" }
-                    }
-                }
 
-                if !error().is_empty() {
-                    div { class: "error", role: "alert", span { "{error}" } }
-                }
-
-                if !transcript().is_empty() {
-                    section { class: "result",
-                        div { class: "result-heading",
-                            span { "TRANSCRIPT" }
-                            button {
-                                class: "copy-button",
-                                onclick: move |_| {
-                                    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(transcript())) {
-                                        Ok(()) => copied.set(true),
-                                        Err(copy_error) => error.set(format!("Could not copy: {copy_error}")),
-                                    }
-                                },
-                                if copied() { "✓  Copied" } else { "Copy" }
+                    button {
+                        class: match phase() {
+                            Phase::Ready => "icon-button mic-button",
+                            Phase::Recording => "icon-button mic-button recording",
+                            Phase::Processing => "icon-button mic-button processing",
+                        },
+                        disabled: phase() == Phase::Processing,
+                        aria_label: match phase() {
+                            Phase::Ready => "Start recording",
+                            Phase::Recording => "Stop recording",
+                            Phase::Processing => "Transcribing",
+                        },
+                        title: match phase() {
+                            Phase::Ready => "Speak · tap Ctrl, then hold Ctrl",
+                            Phase::Recording => "Stop recording",
+                            Phase::Processing => "Transcribing…",
+                        },
+                        onclick: move |_| {
+                            copied.set(false);
+                            error.set(String::new());
+                            if recording_commands.send(RecordingCommand::Toggle).is_err() {
+                                error.set("The recording controller stopped unexpectedly.".to_string());
                             }
+                        },
+                        match phase() {
+                            Phase::Ready => rsx! { Icon { width: 22, height: 22, icon: MdMic } },
+                            Phase::Recording => rsx! { Icon { width: 20, height: 20, icon: MdStop } },
+                            Phase::Processing => rsx! { Icon { class: "processing-icon", width: 20, height: 20, icon: MdHourglassEmpty } },
                         }
-                        p { class: "transcript", "{transcript}" }
                     }
                 }
 
-                footer {
-                    span { class: "privacy-dot" }
-                    "Runs locally · Whisper large-v3-turbo · S1-mini by Superwhisper"
+                button {
+                    class: if menu_open() { "icon-button menu-button active" } else { "icon-button menu-button" },
+                    aria_label: if menu_open() { "Close menu" } else { "Open menu" },
+                    aria_expanded: menu_open(),
+                    title: "Menu",
+                    onclick: move |event| {
+                        event.stop_propagation();
+                        let open = !menu_open();
+                        if open {
+                            menu_open.set(true);
+                            resize_for_menu(&menu_window, true);
+                        } else {
+                            close_menu(menu_open, menu_window.clone());
+                        }
+                    },
+                    Icon { width: 24, height: 24, icon: MdMoreVert }
                 }
             }
+
+            button {
+                    class: if menu_open() { "menu-dismiss-layer open" } else { "menu-dismiss-layer closed" },
+                    aria_label: "Close menu",
+                    aria_hidden: !menu_open(),
+                    tabindex: if menu_open() { "0" } else { "-1" },
+                    onclick: move |_| {
+                        if menu_open() {
+                            close_menu(menu_open, dismiss_window.clone());
+                        }
+                    }
+                }
+                div {
+                    class: if menu_open() { "menu-panel open" } else { "menu-panel closed" },
+                    role: "menu",
+                    aria_hidden: !menu_open(),
+                    onclick: move |event| event.stop_propagation(),
+                    button {
+                        class: "menu-item",
+                        role: "menuitem",
+                        onclick: move |_| {
+                            menu_open.set(false);
+                            view.set(AppView::Settings);
+                            resize_for_settings(&settings_window, true);
+                        },
+                        Icon { width: 18, height: 18, icon: MdSettings }
+                        span { "Settings" }
+                    }
+                    button {
+                        class: "menu-item danger",
+                        role: "menuitem",
+                        onclick: move |_| close_window.close(),
+                        Icon { width: 18, height: 18, icon: MdClose }
+                        span { "Close" }
+                    }
+                }
+
+            if !error().is_empty() {
+                p { class: "sr-only", role: "alert", "{error}" }
+            }
+        }
+        }
         }
     }
 }
