@@ -62,7 +62,7 @@ impl RecordingController {
 }
 
 fn run(commands: mpsc::Receiver<RecordingCommand>, events: mpsc::Sender<RecordingEvent>) {
-    let model_worker = start_model_worker();
+    let mut model_worker = None;
     let mut mode = None;
 
     while let Ok(command) = commands.recv() {
@@ -70,7 +70,7 @@ fn run(commands: mpsc::Receiver<RecordingCommand>, events: mpsc::Sender<Recordin
             RecordingCommand::Toggle => match mode {
                 None => start_recording(RecordingMode::Toggle, &mut mode, &events),
                 Some(_) => {
-                    finish_recording(&model_worker, &mut mode, &events);
+                    finish_recording(&mut model_worker, &mut mode, &events);
                     discard_commands_queued_during_inference(&commands);
                 }
             },
@@ -78,7 +78,7 @@ fn run(commands: mpsc::Receiver<RecordingCommand>, events: mpsc::Sender<Recordin
                 start_recording(RecordingMode::Hold, &mut mode, &events);
             }
             RecordingCommand::StopHold if mode == Some(RecordingMode::Hold) => {
-                finish_recording(&model_worker, &mut mode, &events);
+                finish_recording(&mut model_worker, &mut mode, &events);
                 discard_commands_queued_during_inference(&commands);
             }
             RecordingCommand::StartHold | RecordingCommand::StopHold => {}
@@ -105,7 +105,7 @@ fn start_recording(
 }
 
 fn finish_recording(
-    model_worker: &mpsc::Sender<InferenceJob>,
+    model_worker: &mut Option<mpsc::Sender<InferenceJob>>,
     mode: &mut Option<RecordingMode>,
     events: &mpsc::Sender<RecordingEvent>,
 ) {
@@ -128,6 +128,7 @@ fn finish_recording(
     send_event(events, RecordingEvent::Phase(Phase::Processing));
     let (reply_tx, reply_rx) = mpsc::channel();
     if model_worker
+        .get_or_insert_with(start_model_worker)
         .send(InferenceJob {
             samples,
             reply: reply_tx,

@@ -62,6 +62,15 @@ impl S1Cleaner {
     }
 
     pub fn clean(&mut self, transcript: &str) -> Result<String> {
+        // Release attention state after both success and failure, rather than
+        // keeping the last recording's KV tensors alive while the UI is idle.
+        self.model.clear_kv_cache();
+        let result = self.clean_inner(transcript);
+        self.model.clear_kv_cache();
+        result
+    }
+
+    fn clean_inner(&mut self, transcript: &str) -> Result<String> {
         let vocabulary = self
             .vocabulary
             .cleaner_control()
@@ -79,7 +88,6 @@ impl S1Cleaner {
             bail!("The recording is too long to clean in one pass.");
         }
 
-        self.model.clear_kv_cache();
         let input = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
         let logits = self.model.forward(&input, 0)?.squeeze(0)?;
         let mut logits_processor = LogitsProcessor::from_sampling(0, Sampling::ArgMax);

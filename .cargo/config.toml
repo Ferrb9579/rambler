@@ -1,2 +1,9 @@
+[build]
+jobs = 2
+
+[env]
+# Each ignored audio test owns a model pair. Never load several in parallel.
+RUST_TEST_THREADS = "1"
+
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=native"]

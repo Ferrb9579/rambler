@@ -8,6 +8,9 @@ be built on macOS and Windows, with the platform limitations listed below.
 - A 64-bit CPU and operating system
 - A working microphone
 - Rust's current stable toolchain and Cargo
+- The current Incular checkout beside Rambler at `../incular` (Cargo uses local
+  path dependencies)
+- A desktop session and a compatible Vulkan, OpenGL, Metal, or DirectX GPU driver
 - About 2.8 GB for the included model assets, plus space for the Rust build
 - Enough memory to load the ASR and cleaner models; 8 GB of available RAM is a
   practical minimum for the current model pair
@@ -15,7 +18,8 @@ be built on macOS and Windows, with the platform limitations listed below.
 Rambler runs inference locally on the CPU. It does not require CUDA, ROCm,
 Python, Node.js, a server, or API keys.
 
-The following files must exist before the app starts:
+The following files must exist before transcription can run. The app can open
+without them; use **Settings → Download missing** to install them:
 
 ```text
 assets/models/qwen3-asr-0.6b/model.safetensors
@@ -49,15 +53,13 @@ cargo --version
 
 ## Ubuntu and Debian
 
-Ubuntu 22.04 or newer and Debian 12 or newer provide WebKitGTK 4.1. Install the
-compiler, Dioxus desktop dependencies, ALSA headers, and OpenBLAS:
+Install the compiler, Incular native desktop dependencies, ALSA headers, and
+OpenBLAS:
 
 ```bash
 pkexec apt-get update
-pkexec apt-get install build-essential curl wget file pkg-config lld \
-  libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
-  libayatana-appindicator3-dev librsvg2-dev \
-  libasound2-dev libopenblas-dev
+pkexec apt-get install build-essential curl pkg-config lld \
+  libxkbcommon-dev libwayland-dev libvulkan-dev libasound2-dev libopenblas-dev
 ```
 
 Install the one-time keyboard access rule used by the global Ctrl gestures:
@@ -84,8 +86,7 @@ changes are needed when running the app.
 ## Fedora
 
 ```bash
-pkexec dnf install webkit2gtk4.1-devel openssl-devel curl wget file \
-  libappindicator-gtk3-devel librsvg2-devel libxdo-devel \
+pkexec dnf install curl libxkbcommon-devel wayland-devel vulkan-loader-devel \
   alsa-lib-devel openblas-devel pkgconf-pkg-config
 pkexec dnf group install c-development
 ```
@@ -101,8 +102,7 @@ cargo run --release
 
 ```bash
 pkexec pacman -Syu
-pkexec pacman -S --needed base-devel curl wget file openssl \
-  webkit2gtk-4.1 appmenu-gtk-module libappindicator-gtk3 librsvg xdotool \
+pkexec pacman -S --needed base-devel curl libxkbcommon wayland vulkan-icd-loader \
   alsa-lib openblas pkgconf
 ```
 
@@ -113,8 +113,8 @@ Then install the keyboard rule using the three `pkexec` commands in the
 cargo run --release
 ```
 
-For another Linux distribution, install the equivalents of WebKitGTK 4.1,
-xdotool/libxdo, OpenSSL development headers, ALSA development headers,
+For another Linux distribution, install the equivalents of libxkbcommon,
+Wayland development headers, a Vulkan/OpenGL driver, ALSA development headers,
 OpenBLAS, a C/C++ build toolchain, and `pkg-config`.
 
 ## macOS
@@ -146,9 +146,7 @@ Install:
 1. Visual Studio 2022 Build Tools with **Desktop development with C++** and a
    Windows SDK.
 2. Rust using `rustup-init.exe` and the stable MSVC toolchain.
-3. The Evergreen WebView2 Runtime if it is not already present. Windows 11
-   normally includes it; the installer is available from
-   [Microsoft](https://developer.microsoft.com/microsoft-edge/webview2/).
+3. A current graphics driver supporting DirectX 12, Vulkan, or OpenGL.
 
 The current BLAS-optimized Qwen build supports Linux OpenBLAS and macOS
 Accelerate. On Windows, use the portable CPU fallback:
@@ -166,16 +164,18 @@ Linux-only. The microphone button remains available.
 
 ## Verify the installation
 
-Run the checks from the repository root:
+On Linux with a systemd user session, run checks inside the memory-limited
+runner. It caps the entire command at 8 GiB RAM with no swap and a 20-minute
+timeout, uses two build jobs, and runs tests serially:
 
 ```bash
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+scripts/test-constrained.sh
+scripts/test-constrained.sh cargo clippy --all-targets --locked -- -D warnings
 cargo run --release
 ```
 
-On Windows, use the portable feature flags shown above for commands that build
-the desktop binary:
+On macOS, run Cargo checks directly. On Windows, also use the portable feature
+flags shown above for commands that build the desktop binary:
 
 ```powershell
 cargo test --all-targets --no-default-features --features desktop
@@ -189,10 +189,18 @@ Copy button becomes enabled after a transcript is produced.
 
 ## Troubleshooting
 
-### Linux cannot find WebKitGTK
+### The desktop window cannot start
 
-Confirm that the 4.1 development package is installed. Rambler uses
-WebKitGTK 4.1, not the older 4.0 package.
+Run from a graphical desktop session and check that a compatible Vulkan or
+OpenGL driver is installed. Incular draws the UI through WGPU.
+
+### A test exceeds memory or hangs
+
+Use `scripts/test-constrained.sh` on Linux. Adjust
+`RAMBLER_TEST_MEMORY_HIGH`, `RAMBLER_TEST_MEMORY_MAX`, and
+`RAMBLER_TEST_TIMEOUT` only when the machine has enough available memory.
+See the [audio and memory checks](README.md#end-to-end-audio-check) for model
+tests that reuse one worker and report memory after each request.
 
 ### Linux reports that the Ctrl shortcut is unavailable
 
@@ -230,11 +238,11 @@ test -f assets/models/s1-mini-q4_k_m.gguf
 test -f assets/models/s1-mini-tokenizer.json
 ```
 
-The app intentionally does not download models at runtime.
+Open **Settings → Download missing** to fetch required assets, then record
+again. Downloads run only when explicitly requested.
 
 ## Upstream platform references
 
-- [Dioxus 0.7 platform dependencies](https://dioxuslabs.com/learn/0.7/getting_started/)
+- [Incular installation](https://github.com/FabortLabs/incular/blob/master/docs/content/docs/introduction/installation.mdx)
 - [Rust and Cargo installation](https://doc.rust-lang.org/stable/cargo/getting-started/installation.html)
-- [Microsoft WebView2 Runtime distribution](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution)
 - [Apple microphone authorization](https://developer.apple.com/documentation/bundleresources/requesting-authorization-for-media-capture-on-macos)

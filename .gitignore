@@ -2,3 +2,9 @@
 /dist/
 /.dioxus/
 .DS_Store
+
+# Local model weights, tokenizers, vocabulary, and machine preferences.
+/assets/models/*
+!/assets/models/.gitkeep
+/assets/settings.json
+/assets/settings.json.tmp

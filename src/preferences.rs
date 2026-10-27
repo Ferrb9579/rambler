@@ -15,16 +15,6 @@ pub(crate) enum ThemePreference {
     Dark,
 }
 
-impl ThemePreference {
-    pub(crate) fn class_name(self) -> &'static str {
-        match self {
-            Self::System => "theme-system",
-            Self::Light => "theme-light",
-            Self::Dark => "theme-dark",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Preferences {

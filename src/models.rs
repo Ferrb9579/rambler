@@ -47,11 +47,22 @@ pub fn start_model_worker() -> Sender<InferenceJob> {
 }
 
 fn model_worker(receiver: Receiver<InferenceJob>) {
-    let mut pipeline = ModelPipeline::load().map_err(format_error);
+    let mut pipeline = None;
     for job in receiver {
-        let result = match &mut pipeline {
-            Ok(pipeline) => pipeline.run(&job.samples).map_err(format_error),
-            Err(message) => Err(message.clone()),
+        // A missing/corrupt asset may be repaired from Settings. Retry loading
+        // on the next recording instead of caching that failure until restart.
+        if pipeline.is_none() {
+            match ModelPipeline::load() {
+                Ok(loaded) => pipeline = Some(loaded),
+                Err(error) => {
+                    let _ = job.reply.send(Err(format_error(error)));
+                    continue;
+                }
+            }
+        }
+        let result = match pipeline.as_mut() {
+            Some(pipeline) => pipeline.run(&job.samples).map_err(format_error),
+            None => unreachable!("the pipeline was loaded above"),
         };
         let _ = job.reply.send(result);
     }

@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const TARGET_RATE: u32 = 16_000;
 
@@ -14,7 +14,7 @@ fn speech_pipeline() -> Result<()> {
     let path = env::var("RAMBLER_E2E_WAV")
         .context("set RAMBLER_E2E_WAV to a speech WAV file before running this test")?;
     let samples = read_wav(Path::new(&path))?;
-    // Exercise the same worker/channel path used by the Dioxus button after
+    // Exercise the same worker/channel path used by the Incular button after
     // it stops recording, rather than calling the runtime directly.
     let worker = models::start_model_worker();
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -25,13 +25,51 @@ fn speech_pipeline() -> Result<()> {
         })
         .context("could not send audio to the model worker")?;
     let cleaned = reply_rx
-        .recv()
+        .recv_timeout(Duration::from_secs(300))
         .context("the model worker did not reply")?
         .map_err(anyhow::Error::msg)?;
 
     println!("cleaned transcript: {cleaned}");
     if cleaned.trim().is_empty() {
         bail!("the local ASR/normalizer pipeline returned empty text");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "loads local model weights; run under scripts/test-constrained.sh with RAMBLER_E2E_WAV"]
+fn speech_pipeline_reuses_model_memory() -> Result<()> {
+    let path = env::var("RAMBLER_E2E_WAV").context("set RAMBLER_E2E_WAV to a speech WAV file")?;
+    let samples = read_wav(Path::new(&path))?;
+    let worker = models::start_model_worker();
+    let mut warmed_rss = None;
+    for run in 0..5 {
+        let transcript = submit(&worker, samples.clone()).map_err(anyhow::Error::msg)?;
+        if transcript.trim().is_empty() {
+            bail!("run {run} returned empty text");
+        }
+        let status = fs::read_to_string("/proc/self/status")?;
+        let rss_kib: u64 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .context("VmRSS is missing from /proc/self/status")?
+            .split_whitespace()
+            .next()
+            .context("VmRSS value is missing")?
+            .parse()?;
+        println!(
+            "memory run {}: RSS = {rss_kib} KiB; transcript: {transcript}",
+            run + 1
+        );
+        // Allow allocator/pool warmup, then catch retained per-recording tensors.
+        if run == 1 {
+            warmed_rss = Some(rss_kib);
+        } else if let Some(baseline) = warmed_rss
+            && rss_kib > baseline + 128 * 1024
+        {
+            bail!("RSS grew by more than 128 MiB after warmup: {baseline} -> {rss_kib} KiB");
+        }
     }
     Ok(())
 }
@@ -269,7 +307,7 @@ fn submit(
         })
         .map_err(|error| format!("could not send audio to the model worker: {error}"))?;
     reply_rx
-        .recv()
+        .recv_timeout(Duration::from_secs(300))
         .map_err(|error| format!("the model worker did not reply: {error}"))?
 }
 
